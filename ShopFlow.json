@@ -1,0 +1,1032 @@
+{
+  "name": "WhatsApp Photo to Shopify Listing",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "messages"
+        ],
+        "options": {}
+      },
+      "id": "0b699d36-fd1d-430e-96da-ddd3c555204a",
+      "name": "WhatsApp Trigger",
+      "type": "n8n-nodes-base.whatsAppTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        288
+      ],
+      "webhookId": "dc48b78e-0aab-4ae2-802f-2033f069481e"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s1",
+              "name": "allowedNumbers",
+              "type": "string",
+              "value": "<__PLACEHOLDER_VALUE__Authorized merchant WhatsApp numbers, comma-separated with country code (e.g. 919800000000)__>"
+            },
+            {
+              "id": "s2",
+              "name": "shopSubdomain",
+              "type": "string",
+              "value": "<__PLACEHOLDER_VALUE__Shopify store subdomain (the part before .myshopify.com)__>"
+            },
+            {
+              "id": "s3",
+              "name": "bucketName",
+              "type": "string",
+              "value": "<__PLACEHOLDER_VALUE__R2 / S3 bucket name for product images__>"
+            },
+            {
+              "id": "s4",
+              "name": "publicBaseUrl",
+              "type": "string",
+              "value": "<__PLACEHOLDER_VALUE__Public base URL of the bucket, no trailing slash (e.g. https://pub-xxxx.r2.dev)__>"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "82c339ee-86d5-40dc-b1ba-e8cc509407a2",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        272,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst LF = String.fromCharCode(10);\nconst DAY = 24 * 60 * 60 * 1000;\nconst store = $getWorkflowStaticData('global');\nstore.pendingMedia = store.pendingMedia || {};\nstore.pendingEdit = store.pendingEdit || {};\nconst now = Date.now();\nfor (const k of Object.keys(store.pendingMedia)) { if (now - store.pendingMedia[k].ts > DAY) delete store.pendingMedia[k]; }\nfor (const k of Object.keys(store.pendingEdit)) { if (now - store.pendingEdit[k].ts > DAY) delete store.pendingEdit[k]; }\n\nlet value = input;\nif (!input.messages && Array.isArray(input.entry)) {\n  const ch = ((input.entry[0] || {}).changes || [])[0] || {};\n  value = ch.value || {};\n}\nconst msg = (value.messages || [])[0];\nconst phoneNumberId = String((value.metadata || {}).phone_number_id || '');\nif (!msg) return [{ json: { route: 'ignore', reason: 'no_message', phoneNumberId } }];\n\nconst digits = (s) => String(s || '').replace(/[^0-9]/g, '');\nconst from = digits(msg.from);\nconst allowed = String(input.allowedNumbers || '').split(',').map(digits).filter(Boolean);\nif (!allowed.includes(from)) return [{ json: { route: 'ignore', reason: 'not_whitelisted', from, phoneNumberId } }];\n\nfunction parsePrice(text) {\n  if (!text) return null;\n  const t = String(text).replace(/,/g, '');\n  let m = t.match(/(?:₹|rs\\.?|inr|price\\s*[:=-]?)\\s*(\\d+(?:\\.\\d+)?)\\s*(k)?/i);\n  if (!m) m = t.match(/(\\d+(?:\\.\\d+)?)\\s*(k)?\\b/i);\n  if (!m) return null;\n  let n = parseFloat(m[1]);\n  if (m[2]) n = n * 1000;\n  if (!isFinite(n) || n <= 0) return null;\n  return n.toFixed(2);\n}\nconst display = (p) => '₹' + Number(p).toLocaleString('en-IN', { maximumFractionDigits: 2 });\nconst base = { from, phoneNumberId };\n\nconst gql = (query, variables) => ({ query, variables });\n\nfunction processItem(mediaId, caption, price) {\n  return [{ json: { ...base, route: 'process', mediaId, caption: caption || '', price, priceDisplay: display(price),\n    ackText: 'Got it! Rendering studio photos and writing SEO copy for ' + display(price) + '... I will send the Shopify draft here in a few minutes.' } }];\n}\n\nif (msg.type === 'image') {\n  const mediaId = (msg.image || {}).id;\n  const caption = (msg.image || {}).caption || '';\n  const price = parsePrice(caption);\n  if (price) return processItem(mediaId, caption, price);\n  store.pendingMedia[from] = { mediaId, caption, ts: now };\n  return [{ json: { ...base, route: 'reply', replyText: 'Photo received. Please reply with the price to continue (e.g. ₹1,499).' } }];\n}\n\nif (msg.type === 'interactive' || msg.type === 'button') {\n  const id = msg.type === 'interactive'\n    ? (((msg.interactive || {}).button_reply) || {}).id || ''\n    : ((msg.button || {}).payload) || '';\n  const parts = String(id).split('|');\n  if (parts[0] === 'publish' && parts[1]) {\n    const q = 'mutation productUpdate($product: ProductUpdateInput!) { productUpdate(product: $product) { product { id handle status onlineStoreUrl } userErrors { field message } } }';\n    return [{ json: { ...base, route: 'publish', productId: parts[1], graphqlBody: gql(q, { product: { id: parts[1], status: 'ACTIVE' } }) } }];\n  }\n  if (parts[0] === 'edit' && parts[1] && parts[2]) {\n    store.pendingEdit[from] = { productId: parts[1], variantId: parts[2], ts: now };\n    return [{ json: { ...base, route: 'reply', replyText: 'Sure - reply with the new price (e.g. ₹1,299) and I will update the draft.' } }];\n  }\n  return [{ json: { ...base, route: 'ignore', reason: 'unknown_button' } }];\n}\n\nif (msg.type === 'text') {\n  const body = ((msg.text || {}).body) || '';\n  const price = parsePrice(body);\n  const edit = store.pendingEdit[from];\n  const media = store.pendingMedia[from];\n  if (edit && price) {\n    delete store.pendingEdit[from];\n    const q = 'mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) { productVariantsBulkUpdate(productId: $productId, variants: $variants) { productVariants { id price } userErrors { field message } } }';\n    return [{ json: { ...base, route: 'update_price', price, priceDisplay: display(price),\n      graphqlBody: gql(q, { productId: edit.productId, variants: [{ id: edit.variantId, price }] }) } }];\n  }\n  if (media && price) {\n    delete store.pendingMedia[from];\n    return processItem(media.mediaId, media.caption, price);\n  }\n  if (edit || media) {\n    return [{ json: { ...base, route: 'reply', replyText: 'I could not read a price in that message. Please reply with just the price, e.g. ₹1,499.' } }];\n  }\n  return [{ json: { ...base, route: 'reply', replyText: ['Hi! To list a product:', '1. Send a product photo', '2. Put the price in the caption (e.g. ₹1,499)', '', 'I will create a Shopify draft with studio images and SEO copy.'].join(LF) } }];\n}\n\nreturn [{ json: { ...base, route: 'ignore', reason: 'unsupported_type_' + msg.type } }];"
+      },
+      "id": "c30e68e3-5176-450b-a025-3beec1d31bb6",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "process"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "New product"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "reply"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Text reply"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "publish"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Publish"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "update_price"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Update price"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a67040f6-b198-44ca-9359-c03175d73675",
+      "name": "Route Message",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        720,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "={{ $json.phoneNumberId }}",
+        "recipientPhoneNumber": "={{ $json.from }}",
+        "textBody": "={{ $json.ackText }}",
+        "additionalFields": {}
+      },
+      "id": "06a7d716-9cfd-482f-a5d8-9fc835c3607f",
+      "name": "Send Processing Receipt",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        800,
+        272
+      ],
+      "webhookId": "402a94b1-f108-4891-8c6f-09474d4a534d"
+    },
+    {
+      "parameters": {
+        "resource": "media",
+        "operation": "mediaUrlGet",
+        "mediaGetId": "={{ $('Parse Message').item.json.mediaId }}"
+      },
+      "id": "64aefeb4-0ab6-49bb-8087-65d9f1862cfa",
+      "name": "Get Media URL",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        1024,
+        272
+      ],
+      "webhookId": "266607f9-6ee9-4f0d-b5c3-ab7273f25742"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "whatsAppApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "f2ec48bc-159e-46bc-97e1-fd82f648a75e",
+      "name": "Download Product Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1248,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a senior e-commerce product photography art director.\nStudy the attached merchant phone photo. Merchant caption: \"{{ $('Parse Message').item.json.caption }}\"\n\n1. Identify the product category, main material/texture, colour and finish.\n2. Write 3 BACKGROUND scene prompts for an AI product-photo tool that keeps the product pixel-identical. Describe only surroundings, surface, lighting and props - never describe changes to the product itself.\n- hero: pure seamless white studio background, soft natural contact shadow, marketplace-ready.\n- lifestyle: an aspirational real-world setting that suits this product and its Indian online buyers, natural light.\n- detail: a close, tactile surface that emphasises the material, shallow depth of field, warm directional light.\nKeep each prompt under 60 words.",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "type": "HumanMessagePromptTemplate",
+              "messageType": "imageBinary"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "8997155b-05d5-4da6-a1ab-860a5f0c89d7",
+      "name": "Vision Art Director",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1472,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "maxTokensToSample": 2048
+        }
+      },
+      "id": "d341a2c6-e844-4f19-af2b-b530800bf3ab",
+      "name": "Claude (Art Director)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        1488,
+        352
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": null,
+          "name": "Gateway credits",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"category\":{\"type\":\"string\"},\"material\":{\"type\":\"string\"},\"color\":{\"type\":\"string\"},\"prompts\":{\"type\":\"object\",\"properties\":{\"hero\":{\"type\":\"string\"},\"lifestyle\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\"}},\"required\":[\"hero\",\"lifestyle\",\"detail\"]}},\"required\":[\"category\",\"material\",\"color\",\"prompts\"]}"
+      },
+      "id": "93a7d52d-1000-4d9c-8246-f486de7dba43",
+      "name": "Scene Prompts Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1616,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an e-commerce copywriter specialising in SEO, Generative Engine Optimization (GEO) and Answer Engine Optimization (AEO) for Shopify stores in India.\nLook at the attached product photo. Merchant caption: \"{{ $('Parse Message').item.json.caption }}\". Price: {{ $('Parse Message').item.json.priceDisplay }} (INR).\n\nWrite the listing:\n- title: keyword-rich, under 60 characters, no price.\n- handle: clean lowercase-hyphenated URL handle.\n- seo_title: under 60 characters. seo_description: under 155 characters, includes a buying reason.\n- body_html: semantic HTML only (p, h2, h3, ul, li, table). Open with a 2-sentence benefit summary. Then a \"Specifications\" table with dense factual attributes (material, colour, dimensions or fit if visible, care, use cases). Add a short comparison vs common alternative materials. End with <h2>Frequently Asked Questions</h2> and 4-5 Q&A pairs (h3 question + p answer) covering sizing/fit, care, material, delivery expectations and gifting. Never invent certifications, brand names or exact measurements you cannot see - phrase them generally instead.\n- tags: 6-10 relevant Shopify tags.\n- alt_texts: descriptive alt text for three images - hero (white studio), lifestyle (in-context scene), detail (material close-up).",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "type": "HumanMessagePromptTemplate",
+              "messageType": "imageBinary"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "08ce073d-0211-47f7-a029-fbf0ad44608b",
+      "name": "Search Copywriter",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        2720,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "maxTokensToSample": 4096
+        }
+      },
+      "id": "9a6fbf7a-a060-48ee-9a0a-067fc0088721",
+      "name": "Claude (Copywriter)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        2736,
+        656
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": null,
+          "name": "Gateway credits",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Product title, under 60 characters\"},\"handle\":{\"type\":\"string\",\"description\":\"URL handle, lowercase-hyphenated\"},\"body_html\":{\"type\":\"string\",\"description\":\"Product description HTML including FAQ block\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"seo_title\":{\"type\":\"string\"},\"seo_description\":{\"type\":\"string\"},\"alt_texts\":{\"type\":\"object\",\"properties\":{\"hero\":{\"type\":\"string\"},\"lifestyle\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\"}},\"required\":[\"hero\",\"lifestyle\",\"detail\"]}},\"required\":[\"title\",\"handle\",\"body_html\",\"tags\",\"seo_title\",\"seo_description\",\"alt_texts\"]}"
+      },
+      "id": "3f1abeac-7ff1-4c83-b242-7c07dc3d8444",
+      "name": "Shopify Copy Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        2864,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "={{ $json.phoneNumberId }}",
+        "recipientPhoneNumber": "={{ $json.from }}",
+        "textBody": "={{ $json.replyText }}",
+        "additionalFields": {}
+      },
+      "id": "11ec8473-0b31-4731-b53e-38906a022101",
+      "name": "Send Text Reply",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        912,
+        192
+      ],
+      "webhookId": "4ff5061c-86d8-4f18-8feb-e991d3430592"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Settings').first().json.shopSubdomain }}.myshopify.com/admin/api/2025-10/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.graphqlBody) }}",
+        "options": {}
+      },
+      "id": "cfb667cb-ec4f-4a57-93d4-63e2e47ff385",
+      "name": "Set Product Active",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "={{ $('Parse Message').item.json.phoneNumberId }}",
+        "recipientPhoneNumber": "={{ $('Parse Message').item.json.from }}",
+        "textBody": "={{ (($json.data || {}).productUpdate || {}).userErrors && $json.data.productUpdate.userErrors.length ? 'Could not publish: ' + $json.data.productUpdate.userErrors.map(e => e.message).join('; ') : (($json.data || {}).productUpdate ? 'Your product is now ACTIVE on Shopify: ' + ($json.data.productUpdate.product.onlineStoreUrl || ('https://' + $('Settings').first().json.shopSubdomain + '.myshopify.com/products/' + $json.data.productUpdate.product.handle)) : 'Could not publish: ' + JSON.stringify($json.errors || $json)) }}",
+        "additionalFields": {}
+      },
+      "id": "5cd9a612-7edd-413f-96f5-39efadd34ac5",
+      "name": "Send Live Confirmation",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        1024,
+        512
+      ],
+      "webhookId": "5a2abdef-ff00-4338-9fad-8ff4b7fa3e13"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Settings').first().json.shopSubdomain }}.myshopify.com/admin/api/2025-10/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.graphqlBody) }}",
+        "options": {}
+      },
+      "id": "ca522451-2029-46cc-bcaa-6c0d5db26f61",
+      "name": "Update Variant Price",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        800,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "={{ $('Parse Message').item.json.phoneNumberId }}",
+        "recipientPhoneNumber": "={{ $('Parse Message').item.json.from }}",
+        "textBody": "={{ (($json.data || {}).productVariantsBulkUpdate || {}).userErrors && $json.data.productVariantsBulkUpdate.userErrors.length ? 'Could not update the price: ' + $json.data.productVariantsBulkUpdate.userErrors.map(e => e.message).join('; ') : (($json.data || {}).productVariantsBulkUpdate ? 'Price updated to ' + $('Parse Message').item.json.priceDisplay + '. The product is still a draft until you publish it.' : 'Could not update the price: ' + JSON.stringify($json.errors || $json)) }}",
+        "additionalFields": {}
+      },
+      "id": "b30a0769-f794-4d50-9f19-8cdbc155a73b",
+      "name": "Send Price Confirmation",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        1024,
+        704
+      ],
+      "webhookId": "59cb6722-56c0-4235-97f5-350e601658ad"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $input.first().json.output || {};\nconst prompts = out.prompts || {};\nconst source = $('Download Product Image').first().binary || {};\nconst prefix = 'products/' + $execution.id + '-';\nconst shots = ['hero', 'lifestyle', 'detail'];\nreturn shots.map((shot) => ({\n  json: { shot, prompt: prompts[shot] || '', fileName: prefix + shot + '.png' },\n  binary: source.data ? { data: source.data } : {},\n}));"
+      },
+      "id": "38532df5-5504-4e0f-8e31-b21d6100022f",
+      "name": "Build Render Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://image-api.photoroom.com/v2/edit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpTemplatedCustomAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "imageFile",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "background.prompt",
+              "value": "={{ $json.prompt }}"
+            },
+            {
+              "name": "padding",
+              "value": "0.1"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "c725a1be-b56f-4ad7-a646-3eed3c5c34e5",
+      "name": "Render Studio Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2048,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucketName": "={{ $('Settings').first().json.bucketName }}",
+        "fileName": "={{ $('Build Render Jobs').item.json.fileName }}",
+        "additionalFields": {
+          "acl": "publicRead"
+        }
+      },
+      "id": "f8506f5e-b74d-4097-9575-030d214afd55",
+      "name": "Upload to CDN Bucket",
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [
+        2272,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c1",
+              "name": "shot",
+              "type": "string",
+              "value": "={{ $('Build Render Jobs').item.json.shot }}"
+            },
+            {
+              "id": "c2",
+              "name": "url",
+              "type": "string",
+              "value": "={{ $('Settings').first().json.publicBaseUrl }}/{{ $('Build Render Jobs').item.json.fileName }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2fdc4f6-8275-4bca-b2ef-14e4a1e874d2",
+      "name": "Collect Image URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        2496,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "images",
+        "options": {}
+      },
+      "id": "31adfc99-c2cc-461b-8a2f-242830139894",
+      "name": "Aggregate Image URLs",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        2784,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "1cf1136f-c15d-414d-b23a-b7c8f25ec984",
+      "name": "Merge Images and Copy",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3072,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst copy = item.output || {};\nconst msg = $('Parse Message').first().json;\nconst order = ['hero', 'lifestyle', 'detail'];\nconst images = (item.images || []).filter((i) => i && i.url).sort((a, b) => order.indexOf(a.shot) - order.indexOf(b.shot));\nconst alts = copy.alt_texts || {};\nconst files = images.map((img) => ({ originalSource: img.url, alt: alts[img.shot] || copy.title, contentType: 'IMAGE' }));\nconst input = {\n  title: copy.title,\n  handle: copy.handle,\n  descriptionHtml: copy.body_html,\n  tags: copy.tags || [],\n  status: 'DRAFT',\n  seo: { title: copy.seo_title, description: copy.seo_description },\n  productOptions: [{ name: 'Title', values: [{ name: 'Default Title' }] }],\n  variants: [{ optionValues: [{ optionName: 'Title', name: 'Default Title' }], price: msg.price }],\n  files,\n};\nconst query = 'mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) { productSet(synchronous: $synchronous, input: $input) { product { id handle title status onlineStorePreviewUrl variants(first: 1) { nodes { id price } } } userErrors { field message } } }';\nreturn [{ json: { graphqlBody: { query, variables: { input, synchronous: true } }, heroUrl: images.length ? images[0].url : '', title: copy.title } }];"
+      },
+      "id": "3caaf1f6-3bbc-4a9f-aa6c-57fe59c8a8c3",
+      "name": "Build Shopify Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1328,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $('Settings').first().json.shopSubdomain }}.myshopify.com/admin/api/2025-10/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.graphqlBody) }}",
+        "options": {}
+      },
+      "id": "e417d7a4-4521-46ef-8c85-4227d752e714",
+      "name": "Create Shopify Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1552,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const LF = String.fromCharCode(10);\nconst res = $input.first().json;\nconst ps = (res.data || {}).productSet || {};\nconst errors = (ps.userErrors || []).concat(res.errors || []);\nif (!ps.product || (ps.userErrors || []).length) {\n  throw new Error('Shopify productSet failed: ' + JSON.stringify(errors));\n}\nconst product = ps.product;\nconst variant = ((product.variants || {}).nodes || [])[0] || {};\nconst msg = $('Parse Message').first().json;\nconst settings = $('Settings').first().json;\nconst payload = $('Build Shopify Payload').first().json;\nconst numericId = String(product.id).split('/').pop();\nconst adminUrl = 'https://admin.shopify.com/store/' + settings.shopSubdomain + '/products/' + numericId;\nconst previewUrl = product.onlineStorePreviewUrl || ('https://' + settings.shopSubdomain + '.myshopify.com/products/' + product.handle);\nconst bodyText = [\n  '*' + product.title + '*',\n  'Price: ' + msg.priceDisplay,\n  'Status: Draft',\n  '',\n  'Admin: ' + adminUrl,\n  'Preview: ' + previewUrl,\n].join(LF).slice(0, 1024);\nconst interactive = {\n  type: 'button',\n  body: { text: bodyText },\n  footer: { text: 'Tap to publish or change the price' },\n  action: {\n    buttons: [\n      { type: 'reply', reply: { id: 'publish|' + product.id, title: 'Publish Live Now' } },\n      { type: 'reply', reply: { id: 'edit|' + product.id + '|' + variant.id, title: 'Edit Price' } },\n    ],\n  },\n};\nif (payload.heroUrl) interactive.header = { type: 'image', image: { link: payload.heroUrl } };\nreturn [{ json: {\n  productId: product.id,\n  adminUrl,\n  previewUrl,\n  whatsappBody: { messaging_product: 'whatsapp', recipient_type: 'individual', to: msg.from, type: 'interactive', interactive },\n} }];"
+      },
+      "id": "818e6755-26cb-44c8-926c-3f7827247c8e",
+      "name": "Build Confirmation Card",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1776,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Parse Message').first().json.phoneNumberId }}/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "whatsAppApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.whatsappBody) }}",
+        "options": {}
+      },
+      "id": "013488ce-053a-469e-9baa-b526a5e8b78f",
+      "name": "Send Interactive Card",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2000,
+        128
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "WhatsApp Trigger": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "Route Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Message": {
+      "main": [
+        [
+          {
+            "node": "Send Processing Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Text Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set Product Active",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Variant Price",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Processing Receipt": {
+      "main": [
+        [
+          {
+            "node": "Get Media URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Media URL": {
+      "main": [
+        [
+          {
+            "node": "Download Product Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Product Image": {
+      "main": [
+        [
+          {
+            "node": "Vision Art Director",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Search Copywriter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vision Art Director": {
+      "main": [
+        [
+          {
+            "node": "Build Render Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude (Art Director)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Vision Art Director",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scene Prompts Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Vision Art Director",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Copywriter": {
+      "main": [
+        [
+          {
+            "node": "Merge Images and Copy",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Claude (Copywriter)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Search Copywriter",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify Copy Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Search Copywriter",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Product Active": {
+      "main": [
+        [
+          {
+            "node": "Send Live Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Variant Price": {
+      "main": [
+        [
+          {
+            "node": "Send Price Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Render Jobs": {
+      "main": [
+        [
+          {
+            "node": "Render Studio Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Studio Image": {
+      "main": [
+        [
+          {
+            "node": "Upload to CDN Bucket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to CDN Bucket": {
+      "main": [
+        [
+          {
+            "node": "Collect Image URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Image URL": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Image URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Image URLs": {
+      "main": [
+        [
+          {
+            "node": "Merge Images and Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Images and Copy": {
+      "main": [
+        [
+          {
+            "node": "Build Shopify Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Shopify Payload": {
+      "main": [
+        [
+          {
+            "node": "Create Shopify Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Shopify Draft": {
+      "main": [
+        [
+          {
+            "node": "Build Confirmation Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Confirmation Card": {
+      "main": [
+        [
+          {
+            "node": "Send Interactive Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "afb36350-00b5-48a3-92d1-69cc40e8a0cc",
+  "meta": {
+    "instanceId": "cb68e017476edac8b1f262f06bdcdfceb053dd9d9fe045e44a780d51bb7f5c3d"
+  },
+  "nodeGroups": [
+    {
+      "id": "e60b403c-7b89-4a89-8903-6a7be85ff877",
+      "name": "Read merchant message",
+      "nodeIds": [
+        "82c339ee-86d5-40dc-b1ba-e8cc509407a2",
+        "c30e68e3-5176-450b-a025-3beec1d31bb6",
+        "a67040f6-b198-44ca-9359-c03175d73675"
+      ],
+      "description": "Checks the sender is an approved merchant, reads the price, remembers photos awaiting a price, and picks the next step"
+    },
+    {
+      "id": "e700e904-f9b5-4f97-9a8a-51f26659a498",
+      "name": "Generate listing assets",
+      "nodeIds": [
+        "06a7d716-9cfd-482f-a5d8-9fc835c3607f",
+        "64aefeb4-0ab6-49bb-8087-65d9f1862cfa",
+        "f2ec48bc-159e-46bc-97e1-fd82f648a75e",
+        "8997155b-05d5-4da6-a1ab-860a5f0c89d7",
+        "d341a2c6-e844-4f19-af2b-b530800bf3ab",
+        "93a7d52d-1000-4d9c-8246-f486de7dba43",
+        "9a6fbf7a-a060-48ee-9a0a-067fc0088721",
+        "3f1abeac-7ff1-4c83-b242-7c07dc3d8444",
+        "38532df5-5504-4e0f-8e31-b21d6100022f",
+        "c725a1be-b56f-4ad7-a646-3eed3c5c34e5",
+        "f8506f5e-b74d-4097-9575-030d214afd55",
+        "d2fdc4f6-8275-4bca-b2ef-14e4a1e874d2",
+        "31adfc99-c2cc-461b-8a2f-242830139894",
+        "08ce073d-0211-47f7-a029-fbf0ad44608b",
+        "1cf1136f-c15d-414d-b23a-b7c8f25ec984"
+      ],
+      "description": "Confirms receipt, downloads the photo, then renders 3 studio images to the CDN while writing search-optimised copy"
+    },
+    {
+      "id": "0b6c05ef-b8a7-4ec8-bbe1-9e722d7fc0d6",
+      "name": "Publish draft listing",
+      "nodeIds": [
+        "3caaf1f6-3bbc-4a9f-aa6c-57fe59c8a8c3",
+        "e417d7a4-4521-46ef-8c85-4227d752e714",
+        "818e6755-26cb-44c8-926c-3f7827247c8e",
+        "013488ce-053a-469e-9baa-b526a5e8b78f"
+      ],
+      "description": "Creates the Shopify draft with price and alt-texted images, then sends the merchant a card with Publish and Edit buttons"
+    },
+    {
+      "id": "5af4c7a7-96c4-4336-a278-82ff24ac4628",
+      "name": "Make product live",
+      "nodeIds": [
+        "cfb667cb-ec4f-4a57-93d4-63e2e47ff385",
+        "5cd9a612-7edd-413f-96f5-39efadd34ac5"
+      ],
+      "description": "After the Publish button tap, switches the draft to active and replies with the store link"
+    },
+    {
+      "id": "2b4c9e4d-e8b8-48e3-b273-1334a27f3eb2",
+      "name": "Change product price",
+      "nodeIds": [
+        "ca522451-2029-46cc-bcaa-6c0d5db26f61",
+        "b30a0769-f794-4d50-9f19-8cdbc155a73b"
+      ],
+      "description": "After Edit Price and a new price reply, updates the variant price and confirms on WhatsApp"
+    }
+  ],
+  "id": "uNTY15jKokVRhkHq",
+  "tags": []
+}
